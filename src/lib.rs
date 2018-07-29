@@ -11,6 +11,8 @@
 #[macro_use]
 extern crate std;
 
+extern crate slot;
+
 pub use mutex::*;
 pub use rw_lock::*;
 

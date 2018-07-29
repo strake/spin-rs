@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicUsize, Ordering, spin_loop_hint as cpu_relax};
 /// ```
 pub struct Once<T> {
     state: AtomicUsize,
-    data: UnsafeCell<Option<T>>, // TODO remove option and use mem::uninitialized
+    data: UnsafeCell<Slot<T>>,
 }
 
 // Same unsafe impls as `std::sync::RwLock`, because this also allows for
@@ -36,22 +36,20 @@ const COMPLETE: usize = 0x2;
 const PANICKED: usize = 0x3;
 
 use core::hint::unreachable_unchecked as unreachable;
+use core::mem;
+use slot::Slot;
 
 impl<T> Once<T> {
     /// Creates a new `Once` value.
     pub const fn new() -> Once<T> {
         Once {
             state: AtomicUsize::new(INCOMPLETE),
-            data: UnsafeCell::new(None),
+            data: UnsafeCell::new(Slot::new()),
         }
     }
 
-    fn force_get<'a>(&'a self) -> &'a T {
-        match unsafe { &*self.data.get() }.as_ref() {
-            None    => unsafe { unreachable() },
-            Some(p) => p,
-        }
-    }
+    unsafe fn as_ref(&self) -> &T { (*self.data.get()).as_ref() }
+    unsafe fn as_mut(&self) -> &mut T { (*self.data.get()).as_mut() }
 
     /// Performs an initialization routine once and only once. The given closure
     /// will be executed if this is the first time `call_once` has been called,
@@ -93,15 +91,15 @@ impl<T> Once<T> {
                                                  Ordering::SeqCst);
             if status == INCOMPLETE { // We init
                 // We use a guard (Finish) to catch panics caused by builder
-                let mut finish = Finish { state: &self.state, panicked: true };
-                unsafe { *self.data.get() = Some(builder()) };
-                finish.panicked = false;
+                let finish = Finish(&self.state);
+                unsafe { *self.as_mut() = builder() };
+                mem::forget(finish);
 
                 status = COMPLETE;
                 self.state.store(status, Ordering::SeqCst);
 
                 // This next line is strictly an optomization
-                return self.force_get();
+                return unsafe { self.as_ref() };
             }
         }
 
@@ -113,7 +111,7 @@ impl<T> Once<T> {
                     status = self.state.load(Ordering::SeqCst)
                 },
                 PANICKED => panic!("Once has panicked"),
-                COMPLETE => return self.force_get(),
+                COMPLETE => return unsafe { self.as_ref() },
                 _ => unsafe { unreachable() },
             }
         }
@@ -122,7 +120,7 @@ impl<T> Once<T> {
     /// Returns a pointer iff the `Once` was previously initialized
     pub fn try<'a>(&'a self) -> Option<&'a T> {
         match self.state.load(Ordering::SeqCst) {
-            COMPLETE => Some(self.force_get()),
+            COMPLETE => Some(unsafe { self.as_ref() }),
             _        => None,
         }
     }
@@ -134,7 +132,7 @@ impl<T> Once<T> {
             match self.state.load(Ordering::SeqCst) {
                 INCOMPLETE => return None,
                 RUNNING    => cpu_relax(), // We spin
-                COMPLETE   => return Some(self.force_get()),
+                COMPLETE   => return Some(unsafe { self.as_ref() }),
                 PANICKED   => panic!("Once has panicked"),
                 _ => unsafe { unreachable() },
             }
@@ -142,17 +140,10 @@ impl<T> Once<T> {
     }
 }
 
-struct Finish<'a> {
-    state: &'a AtomicUsize,
-    panicked: bool,
-}
+struct Finish<'a>(&'a AtomicUsize);
 
 impl<'a> Drop for Finish<'a> {
-    fn drop(&mut self) {
-        if self.panicked {
-            self.state.store(PANICKED, Ordering::SeqCst);
-        }
-    }
+    fn drop(&mut self) { self.0.store(PANICKED, Ordering::SeqCst); }
 }
 
 #[cfg(test)]
